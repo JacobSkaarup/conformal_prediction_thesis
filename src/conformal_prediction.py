@@ -494,7 +494,7 @@ class CPS:
         else:
             raise ValueError("Invalid difficulty model. Choose from 'knn', 'rf' or None.")
         
-    def calibrate(self, X_calibration, y_calibration, k=25, bins=8, mondrian_strategy='predictions'):
+    def calibrate(self, X_calibration, y_calibration, k=25, bins=8, mondrian_strategy='difficulty'):
         """Calibrates the CPS using the calibration data and specified Mondrian categorization strategy.
         Parameters:
             X_calibration (array-like): The feature matrix for the calibration set.
@@ -553,7 +553,10 @@ class CPS:
         Returns:
             array-like: The conformal predictive distributions for the test set.
         """
-        return self.wrapedEstimator.predict_cpds(X_test)
+        cdfs = self.wrapedEstimator.predict_cpds(X_test)
+        if cdfs.ndim == 1:
+            cdfs = pad_cdfs(cdfs)
+        return cdfs
     
     def predict_cps(self, X_test, lower_percentiles, higher_percentiles):
         """Generates conformal prediction intervals for the test data based on specified percentiles.
@@ -576,7 +579,111 @@ class CPS:
         """
         return self.wrapedEstimator.predict_p(X_test, y = y_val)
 
+class MartingaleCPS(CPS):
+    """
+    Martingale-based Conformal Predictive System for online recalibration.
+    Inherits from CPS and monitors p-values for distribution drift using a 
+    SimpleJumper martingale, dynamically shifting the calibration set.
+    """
+    def __init__(self, regression_model):
+        super().__init__(regression_model)
 
+    def calibrate_with_pits(self, X_train, y_train, X_calibration, y_calibration, window_size, 
+                            thres=1e3, batch_size=24, mondrian_strategy='predictions', bins=10):
+        """
+        Performs a rolling calibration to compute Probability Integral Transforms (PITs) 
+        over the historical calibration set.
+        """
+        X_hist = X_train.iloc[-window_size:].copy()
+        y_hist = y_train.iloc[-window_size:].copy()
+        X_hold = X_calibration.copy()
+        y_hold = y_calibration.copy()
+        
+        rng = np.random.default_rng(42)
+        pit_chunks = []
+        
+        while True:
+            # Utilize inherited calibrate method
+            self.calibrate(X_hist, y_hist, bins=bins, mondrian_strategy=mondrian_strategy)
+            
+            pred_cdf_cal = self.predict_cpds(X_hold)
+            p_values_cal = self.predict_p(X_hold, y_hold.values)
+            
+            sj_cal = SimpleJumper().apply(p_values_cal)
+            crossing_cal = np.where(sj_cal > thres)[0]
+            
+            if crossing_cal.size == 0:
+                block_end = len(X_hold)
+            else:
+                block_end = int(np.ceil(crossing_cal[0] / batch_size) * batch_size)
+                block_end = max(1, min(block_end, len(X_hold)))
+                
+            pred_block = pred_cdf_cal[:block_end]
+            y_block = y_hold.iloc[:block_end].values
+            
+            # Requires randomized_pit_batch to be imported from src.metrics
+            pit_block = randomized_pit_batch(pred_block, y_block, rng=rng)
+            pit_chunks.append(pit_block)
+            
+            if block_end >= len(X_hold):
+                break
+                
+            X_hist = pd.concat([X_hist, X_hold.iloc[:block_end]], axis=0).iloc[-window_size:]
+            y_hist = pd.concat([y_hist, y_hold.iloc[:block_end]], axis=0).iloc[-window_size:]
+            X_hold = X_hold.iloc[block_end:]
+            y_hold = y_hold.iloc[block_end:]
+            
+        pit_values_cal = np.concatenate(pit_chunks, axis=0)
+        return pd.Series(pit_values_cal, index=y_calibration.index, name="pit")
+
+    def predict_online(self, X_validation, y_validation, X_calibration, y_calibration, window_size, 
+                       thres=1e3, batch_size=24, mondrian_strategy='difficulty', bins=10):
+        """
+        Generates conformal predictive distributions iteratively over the validation set.
+        When drift is detected via the SimpleJumper martingale, the calibration window 
+        is rolled forward.
+        """
+        X_cal = X_calibration.iloc[-window_size:].copy()
+        y_cal = y_calibration.iloc[-window_size:].copy()
+        X_val = X_validation.copy()
+        y_val = y_validation.copy()
+        
+        cdfs = []
+        recalibration_points = []
+        
+        while True:
+            self.calibrate(X_cal, y_cal, bins=bins, mondrian_strategy=mondrian_strategy)
+            
+            pred_cdf = self.predict_cpds(X_val)
+            p_values = self.predict_p(X_val, y_val.values)
+            
+            sj = SimpleJumper().apply(p_values)
+            crossing = np.where(sj > thres)[0]
+            
+            if crossing.size == 0:
+                cdfs.append(pred_cdf)
+                break
+            else:
+                crossing_idx = int(np.ceil(crossing[0] / batch_size) * batch_size)
+                
+                if crossing_idx >= len(X_val):
+                    cdfs.append(pred_cdf)
+                    break
+                    
+                recalibration_points.append(crossing_idx)
+                cdfs.append(pred_cdf[:crossing_idx])
+                
+                X_cal = pd.concat([X_cal, X_val.iloc[:crossing_idx]], axis=0).iloc[-window_size:]
+                y_cal = pd.concat([y_cal, y_val.iloc[:crossing_idx]], axis=0).iloc[-window_size:]
+                X_val = X_val.iloc[crossing_idx:]
+                y_val = y_val.iloc[crossing_idx:]
+                
+        if mondrian_strategy is not None:
+            cpds_scaled = pad_cdfs(cdfs)
+        else:
+            cpds_scaled = np.concatenate(cdfs, axis=0)
+            
+        return cpds_scaled, np.array(recalibration_points)
 
 class covariateShiftCP():
     def __init__(self, regression_model):
@@ -624,32 +731,6 @@ class covariateShiftCP():
         return lower_adapted, upper_adapted
     
 
-class covariateShiftCPS():
-    def __init__(self, regression_model):
-        self.wrapedEstimator = WrapRegressor(regression_model)
-
-    def fit(self, X_tr, y_train, X_ca, y_calibration):
-        self.wrapedEstimator.fit(X_tr, y_train)
-        self.wrapedEstimator.calibrate(X_ca, y_calibration.values, cps = True)
-
-
-    def conformalize(self, X_ca, X_te, alpha=0.1, inflation_factor=0.3):
-        X_domain = np.vstack([X_ca, X_te.values])
-        y_domain = np.concatenate([np.zeros(len(X_ca)), np.ones(len(X_te))])
-        self.shift_detector = LogisticRegression(C=0.1).fit(X_domain, y_domain)
-
-        # Get shift probabilities (0 to 1)
-        shift_probs = self.shift_detector.predict_proba(X_te.values)[:, 1]
-
-        # Define an inflation factor: 1.0 (no shift) to 5.0 (total shift)
-        # This is a heuristic to widen intervals where we are "surprised" by X
-        inflation = 1 + (shift_probs * inflation_factor) 
-
-
-        cpds = self.wrapedEstimator.predict_cpds(X_te)
-        cpds_adjusted = cpds * inflation[:, np.newaxis]  # Scale the predictive distributions by the inflation factor
-
-        return cpds_adjusted
 
 
 class ImportanceWeightedCPS:
@@ -832,6 +913,255 @@ class ClassifierWeightedCPS(ImportanceWeightedCPS):
         return super().predict_percentiles(X_test, percentiles, calibration_weights=cal_weights)
     
 
+class QCP:
+    """Quantile Conformal Prediction (QCP) with optional feature-space clustering 
+    and importance weighting for covariate shift.
+    """
+    def __init__(
+        self,
+        use_clustering: bool = False,
+        clustering_method: str = "kmeans",
+        n_clusters: int = 2,
+        asymmetric: bool = False,
+        weighted: bool = False,
+        blend_clusters: bool = True,
+        interpolator_kind: str = "linear",
+        random_state: int = 42
+    ):
+        self.use_clustering = use_clustering
+        self.clustering_method = clustering_method.lower() if clustering_method else None
+        self.n_clusters = n_clusters
+        self.asymmetric = asymmetric
+        self.weighted = weighted
+        self.blend_clusters = blend_clusters
+        self.interpolator_kind = interpolator_kind
+        self.random_state = random_state
+
+        # Calibration state variables
+        self.alphas = None
+        self.clustering_model = None
+        self.cluster_edges = None
+        self.q_corr_low = None
+        self.q_corr_high = None
+        self.q_corr_sym = None
+        self._fitted = False
+
+    @staticmethod
+    def _weighted_quantile(scores_1d, weights_1d, alpha_tail):
+        idx = np.argsort(scores_1d)
+        s = scores_1d[idx]
+        w = np.asarray(weights_1d, dtype=float)[idx]
+        w = np.clip(w, 1e-12, None)
+        cw = np.cumsum(w)
+        cw /= cw[-1]
+        target = np.clip(1.0 - alpha_tail, 0.0, 1.0 - 1e-12)
+        pos = np.searchsorted(cw, target, side="left")
+        pos = min(pos, len(s) - 1)
+        return s[pos]
+
+    def _covariate_weights(self, Xc, Xv):
+        Xc = np.asarray(Xc)
+        Xv = np.asarray(Xv)
+        X_combined = np.vstack([Xc, Xv])
+        y_combined = np.hstack([np.zeros(len(Xc)), np.ones(len(Xv))])
+        clf = LogisticRegression(
+            max_iter=5000, solver="lbfgs", tol=1e-4, random_state=self.random_state
+        ).fit(X_combined, y_combined)
+        p = clf.predict_proba(Xc)[:, 1]
+        return np.clip(p / (1.0 - p + 1e-6), 0.1, 10.0)
+
+    def calibrate(self, X_cal, y_cal, preds_cal, alphas, X_val=None):
+        """Compute non-conformity scores and cluster-specific quantile corrections."""
+        self.alphas = np.asarray(alphas, dtype=float)
+        n_alpha = len(self.alphas)
+
+        if not hasattr(preds_cal, "quantile"):
+            preds_cal = pd.DataFrame(preds_cal)
+
+        y_cal_arr = as_numpy_1d(y_cal)
+        if preds_cal.shape[0] != len(y_cal_arr):
+            raise ValueError("preds_cal rows must match length of y_cal")
+        if self.use_clustering and self.n_clusters < 1:
+            raise ValueError("n_clusters must be >= 1")
+        if self.weighted and X_val is None:
+            raise ValueError("X_val must be provided for importance weighting calculations.")
+
+        # Precompute base quantiles and non-conformity scores
+        q_low_cal = preds_cal.quantile(self.alphas / 2, axis=1).values
+        q_high_cal = preds_cal.quantile(1 - self.alphas / 2, axis=1).values
+        alpha_tail = self.alphas / 2.0 if self.asymmetric else self.alphas
+
+        if self.asymmetric:
+            scores_low = q_low_cal - y_cal_arr
+            scores_high = y_cal_arr - q_high_cal
+        else:
+            scores_sym = np.maximum(q_low_cal - y_cal_arr, y_cal_arr - q_high_cal)
+
+        # Build structural clusters
+        n_clusters_eff = self.n_clusters if self.use_clustering else 1
+        Xc = as_numpy_2d(X_cal)
+
+        if not self.use_clustering:
+            bin_indices = np.zeros(len(y_cal), dtype=int)
+        else:
+            if self.clustering_method == "kmeans":
+                self.clustering_model = KMeans(n_clusters=n_clusters_eff, random_state=self.random_state).fit(Xc)
+                bin_indices = self.clustering_model.predict(Xc)
+            elif self.clustering_method == "variance":
+                cal_var = preds_cal.std(axis=1).values
+                self.cluster_edges = np.quantile(cal_var, np.linspace(0, 1, n_clusters_eff + 1))
+                bin_indices = np.digitize(cal_var, self.cluster_edges[1:-1])
+            elif self.clustering_method == "gaussian_mixture":
+                self.clustering_model = GaussianMixture(n_components=n_clusters_eff, random_state=self.random_state).fit(Xc)
+                bin_indices = self.clustering_model.predict(Xc)
+            else:
+                raise ValueError(f"Unsupported clustering_method: {self.clustering_method}")
+
+        # Compute importance weights for covariate shift
+        cal_weights = self._covariate_weights(Xc, as_numpy_2d(X_val)) if self.weighted else np.ones(len(y_cal), dtype=float)
+
+        # Process quantile corrections per cluster partition
+        if self.asymmetric:
+            self.q_corr_low = np.full((n_clusters_eff, n_alpha), np.nan, dtype=float)
+            self.q_corr_high = np.full((n_clusters_eff, n_alpha), np.nan, dtype=float)
+        else:
+            self.q_corr_sym = np.full((n_clusters_eff, n_alpha), np.nan, dtype=float)
+
+        for c in range(n_clusters_eff):
+            mask = bin_indices == c
+            n_c = int(mask.sum())
+            if n_c == 0:
+                continue
+
+            w_c = cal_weights[mask]
+            if self.asymmetric:
+                s_low_c, s_high_c = scores_low[:, mask], scores_high[:, mask]
+                if self.weighted:
+                    self.q_corr_low[c] = [self._weighted_quantile(s_low_c[i], w_c, alpha_tail[i]) for i in range(n_alpha)]
+                    self.q_corr_high[c] = [self._weighted_quantile(s_high_c[i], w_c, alpha_tail[i]) for i in range(n_alpha)]
+                else:
+                    levels = np.clip(np.ceil((n_c + 1) * (1 - alpha_tail)) / n_c, 0, 1)
+                    self.q_corr_low[c] = [np.quantile(s_low_c[i], levels[i], method="higher") for i in range(n_alpha)]
+                    self.q_corr_high[c] = [np.quantile(s_high_c[i], levels[i], method="higher") for i in range(n_alpha)]
+            else:
+                s_sym_c = scores_sym[:, mask]
+                if self.weighted:
+                    self.q_corr_sym[c] = [self._weighted_quantile(s_sym_c[i], w_c, alpha_tail[i]) for i in range(n_alpha)]
+                else:
+                    levels = np.clip(np.ceil((n_c + 1) * (1 - alpha_tail)) / n_c, 0, 1)
+                    self.q_corr_sym[c] = [np.quantile(s_sym_c[i], levels[i], method="higher") for i in range(n_alpha)]
+
+        # Global fallbacks for any unrepresented cluster partitions
+        all_mask = np.ones(len(y_cal), dtype=bool)
+        n_all = len(y_cal)
+        if self.asymmetric:
+            if self.weighted:
+                global_low = [self._weighted_quantile(scores_low[:, all_mask][i], cal_weights, alpha_tail[i]) for i in range(n_alpha)]
+                global_high = [self._weighted_quantile(scores_high[:, all_mask][i], cal_weights, alpha_tail[i]) for i in range(n_alpha)]
+            else:
+                levels_all = np.clip(np.ceil((n_all + 1) * (1 - alpha_tail)) / n_all, 0, 1)
+                global_low = [np.quantile(scores_low[i], levels_all[i], method="higher") for i in range(n_alpha)]
+                global_high = [np.quantile(scores_high[i], levels_all[i], method="higher") for i in range(n_alpha)]
+            
+            for c in range(n_clusters_eff):
+                if np.isnan(self.q_corr_low[c]).any(): self.q_corr_low[c] = global_low
+                if np.isnan(self.q_corr_high[c]).any(): self.q_corr_high[c] = global_high
+        else:
+            if self.weighted:
+                global_sym = [self._weighted_quantile(scores_sym[:, all_mask][i], cal_weights, alpha_tail[i]) for i in range(n_alpha)]
+            else:
+                levels_all = np.clip(np.ceil((n_all + 1) * (1 - alpha_tail)) / n_all, 0, 1)
+                global_sym = [np.quantile(scores_sym[i], levels_all[i], method="higher") for i in range(n_alpha)]
+            
+            for c in range(n_clusters_eff):
+                if np.isnan(self.q_corr_sym[c]).any(): self.q_corr_sym[c] = global_sym
+
+        self._fitted = True
+        return self
+
+    def predict(self, X_val, preds_val, return_type: str = "interpolators"):
+        """Apply the calibrated corrections to the validation predictions."""
+        if not self._fitted:
+            raise RuntimeError("Model must be calibrated before executing predictions.")
+
+        if not hasattr(preds_val, "quantile"):
+            preds_val = pd.DataFrame(preds_val)
+
+        n_val = len(preds_val)
+        Xv = as_numpy_2d(X_val)
+
+        val_low_raw = preds_val.quantile(self.alphas / 2, axis=1).values
+        val_high_raw = preds_val.quantile(1 - self.alphas / 2, axis=1).values
+
+        # Resolve cluster scaling/weights mapping
+        n_clusters_eff = self.n_clusters if self.use_clustering else 1
+        val_cluster_weights = np.zeros((n_val, n_clusters_eff))
+
+        if not self.use_clustering:
+            val_bin_indices = np.zeros(n_val, dtype=int)
+            val_cluster_weights[:, 0] = 1.0
+        else:
+            if self.clustering_method == "kmeans":
+                val_bin_indices = self.clustering_model.predict(Xv)
+                d = self.clustering_model.transform(Xv)
+                w_raw = 1.0 / (d + 1e-6)
+                w_cap = np.quantile(w_raw, 0.99, axis=1, keepdims=True)
+                w = np.minimum(w_raw, np.maximum(w_cap, 1e3))
+                val_cluster_weights = w / np.maximum(w.sum(axis=1, keepdims=True), 1e-12)
+            elif self.clustering_method == "variance":
+                val_var = preds_val.std(axis=1).values
+                val_bin_indices = np.digitize(val_var, self.cluster_edges[1:-1])
+                val_cluster_weights[np.arange(n_val), val_bin_indices] = 1.0
+            elif self.clustering_method == "gaussian_mixture":
+                val_bin_indices = self.clustering_model.predict(Xv)
+                val_cluster_weights = self.clustering_model.predict_proba(Xv)
+                val_cluster_weights /= np.maximum(val_cluster_weights.sum(axis=1, keepdims=True), 1e-12)
+
+        use_soft = self.use_clustering and self.blend_clusters and (self.clustering_method in ("kmeans", "gaussian_mixture"))
+
+        if self.asymmetric:
+            if use_soft:
+                corr_low = (val_cluster_weights @ self.q_corr_low).T
+                corr_high = (val_cluster_weights @ self.q_corr_high).T
+            else:
+                corr_low, corr_high = np.zeros_like(val_low_raw), np.zeros_like(val_high_raw)
+                for c in range(n_clusters_eff):
+                    m = val_bin_indices == c
+                    if np.any(m):
+                        corr_low[:, m] = self.q_corr_low[c][:, None]
+                        corr_high[:, m] = self.q_corr_high[c][:, None]
+            val_low_conf = val_low_raw - corr_low
+            val_high_conf = val_high_raw + corr_high
+        else:
+            if use_soft:
+                corr = (val_cluster_weights @ self.q_corr_sym).T
+            else:
+                corr = np.zeros_like(val_low_raw)
+                for c in range(n_clusters_eff):
+                    m = val_bin_indices == c
+                    if np.any(m):
+                        corr[:, m] = self.q_corr_sym[c][:, None]
+            val_low_conf = val_low_raw - corr
+            val_high_conf = val_high_raw + corr
+
+        if return_type == "bounds":
+            return val_low_conf, val_high_conf
+
+        if return_type == "interpolators":
+            probs = np.concatenate([self.alphas / 2, 1 - self.alphas / 2])
+            all_values = np.vstack([val_low_conf, val_high_conf]).T
+            sort_idx = np.argsort(probs)
+            probs_sorted = probs[sort_idx]
+            all_values = np.maximum.accumulate(all_values[:, sort_idx], axis=1)
+
+            if self.interpolator_kind == "cubic":
+                return [PchipInterpolator(x=probs_sorted, y=all_values[i]) for i in range(n_val)]
+            elif self.interpolator_kind == "linear":
+                return [interp1d(probs_sorted, all_values[i], kind="linear", fill_value="extrapolate") for i in range(n_val)]
+            else:
+                raise ValueError(f"Unsupported interpolator_kind: {self.interpolator_kind}")
+
+
 
 def conformalize_distribution(
     X_cal,
@@ -1002,7 +1332,7 @@ def conformalize_distribution(
         cal_weights = _covariate_weights(Xc_feats, Xv_feats)
     else:
         cal_weights = np.ones(len(y_cal), dtype=float)
-
+ 
     # ---------- Quantile corrections per cluster ----------
     if asymmetric:
         q_corr_low = np.full((n_clusters_eff, n_alpha), np.nan, dtype=float)

@@ -13,3 +13,8 @@ pyarrow
 ipykernel
 ipywidgets
 optuna
+crepes
+lightgbm
+requests
+torch
+xgboost
